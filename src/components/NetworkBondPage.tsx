@@ -187,6 +187,8 @@ const NetworkBondPage: FC = () => {
   /** Static IPv4 address per node name. */
   const [nodeAddresses, setNodeAddresses] = useState<Record<string, string>>({});
   const [creating, setCreating] = useState(false);
+  /** Progress of a one-node-at-a-time create. */
+  const [createPhase, setCreatePhase] = useState('');
   const [createError, setCreateError] = useState<string | null>(null);
   const [created, setCreated] = useState<{ policyNames: string[]; bondName: string }>({
     policyNames: [],
@@ -292,7 +294,9 @@ const NetworkBondPage: FC = () => {
   const ipv4: BondIpv4Config = useMemo(
     () => ({
       mode: ipv4Mode,
-      prefixLength: parseInt(prefixLength, 10) || 24,
+      // Invalid input stays invalid (NaN / 0) so validation reports it
+      // instead of silently falling back to /24.
+      prefixLength: /^\d+$/.test(prefixLength.trim()) ? parseInt(prefixLength, 10) : NaN,
       gateway,
     }),
     [ipv4Mode, prefixLength, gateway],
@@ -403,54 +407,13 @@ const NetworkBondPage: FC = () => {
     navigate('/community-tools/network');
   };
 
-  const handleCreate = useCallback(async () => {
-    if (plan.policies.length === 0 || plan.issues.length > 0) return;
-    setCreating(true);
-    setCreateError(null);
-    setCreated({ policyNames: [], bondName: '' });
-    const policyNames = plan.policies.map((p) => p.metadata.name);
-    dashboardLogger.info(
-      LOG_ACTION,
-      'Create started',
-      `bond=${bondName.trim()} mode=${bondMode} nics=${selectedPorts.join(',')} policies=${policyNames.join(',')} nodes=${plan.targetNodeNames.join(',')}`,
-    );
-
-    const succeeded: string[] = [];
-    try {
-      for (const policy of plan.policies) {
-        await k8sCreate({
-          model: NodeNetworkConfigurationPolicyModel,
-          data: policy as unknown as K8sResourceCommon,
-        });
-        succeeded.push(policy.metadata.name);
-      }
-      dashboardLogger.info(LOG_ACTION, 'Create succeeded', succeeded.join(', '));
-      setCreated({ policyNames: succeeded, bondName: bondName.trim() });
-    } catch (err) {
-      const msg = getK8sErrorMessage(err);
-      dashboardLogger.error(LOG_ACTION, 'Create failed', msg);
-      const suffix =
-        succeeded.length > 0
-          ? ` ${t('Created before failure')}: ${succeeded.join(', ')}.`
-          : '';
-      setCreateError(`${msg}${suffix}`);
-      if (succeeded.length > 0) {
-        setCreated({ policyNames: succeeded, bondName: bondName.trim() });
-      }
-    } finally {
-      setCreating(false);
-    }
-  }, [plan.policies, plan.issues.length, plan.targetNodeNames, bondName, bondMode, selectedPorts, t]);
-
-  const handleCreateAnother = useCallback(() => {
-    const nextName = plan.suggestedBondName || 'bond0';
-    dashboardLogger.info(LOG_ACTION, 'Create another bond', `next=${nextName}`);
-    clearCreated();
-    setBondName(nextName);
-  }, [plan.suggestedBondName, clearCreated]);
-
   const waitForNncpApply = useCallback(
-    async (name: string, minGeneration: number, startedAtMs: number) => {
+    async (
+      name: string,
+      minGeneration: number,
+      startedAtMs: number,
+      onPhase: (message: string) => void = setRemovePhase,
+    ) => {
       const deadline = Date.now() + NNCP_APPLY_TIMEOUT_MS;
       while (Date.now() < deadline) {
         const nncp = (await k8sGet({
@@ -464,7 +427,7 @@ const NetworkBondPage: FC = () => {
         });
         const progress = nnceProgressSummary(nncesRef.current, name, minGeneration);
         if (progress.total > 0) {
-          setRemovePhase(
+          onPhase(
             t('Waiting for NMState to apply {{name}} ({{ready}}/{{total}} nodes)...', {
               name,
               ready: String(progress.ready),
@@ -472,7 +435,7 @@ const NetworkBondPage: FC = () => {
             }),
           );
         } else {
-          setRemovePhase(t('Waiting for NMState to apply {{name}}...', { name }));
+          onPhase(t('Waiting for NMState to apply {{name}}...', { name }));
         }
         if (outcome === 'success') return;
         if (outcome === 'failed') {
@@ -484,6 +447,97 @@ const NetworkBondPage: FC = () => {
     },
     [t],
   );
+
+  const handleCreate = useCallback(async () => {
+    if (plan.policies.length === 0 || plan.issues.length > 0) return;
+    setCreating(true);
+    setCreateError(null);
+    setCreated({ policyNames: [], bondName: '' });
+    const policyNames = plan.policies.map((p) => p.metadata.name);
+    dashboardLogger.info(
+      LOG_ACTION,
+      'Create started',
+      `bond=${bondName.trim()} mode=${bondMode} nics=${selectedPorts.join(',')} policies=${policyNames.join(',')} nodes=${plan.targetNodeNames.join(',')}`,
+    );
+
+    // Per-node policies each target one node, so NMState's maxUnavailable
+    // cannot stagger them: create them one at a time and wait for each node
+    // to apply its policy before touching the next. Stop at the first failure.
+    const oneNodeAtATime = plan.strategy === 'per-node' && plan.policies.length > 1;
+    const succeeded: string[] = [];
+    try {
+      for (let index = 0; index < plan.policies.length; index++) {
+        const policy = plan.policies[index];
+        const name = policy.metadata.name;
+        if (oneNodeAtATime) {
+          setCreatePhase(
+            t('Creating {{name}} ({{index}} of {{total}})...', {
+              name,
+              index: String(index + 1),
+              total: String(plan.policies.length),
+            }),
+          );
+        }
+        const startedAtMs = Date.now();
+        const createdPolicy = (await k8sCreate({
+          model: NodeNetworkConfigurationPolicyModel,
+          data: policy as unknown as K8sResourceCommon,
+        })) as NncpKind;
+        succeeded.push(name);
+        if (oneNodeAtATime && index < plan.policies.length - 1) {
+          await waitForNncpApply(
+            name,
+            createdPolicy.metadata.generation ?? 1,
+            startedAtMs,
+            (message) =>
+              setCreatePhase(
+                `${message} ${t('{{index}} of {{total}} nodes; keep this page open until all nodes are done.', {
+                  index: String(index + 1),
+                  total: String(plan.policies.length),
+                })}`,
+              ),
+          );
+        }
+      }
+      dashboardLogger.info(LOG_ACTION, 'Create succeeded', succeeded.join(', '));
+      setCreated({ policyNames: succeeded, bondName: bondName.trim() });
+    } catch (err) {
+      const msg = getK8sErrorMessage(err);
+      dashboardLogger.error(LOG_ACTION, 'Create failed', msg);
+      const suffix =
+        succeeded.length > 0
+          ? ` ${t('Created before failure')}: ${succeeded.join(', ')}.${
+              oneNodeAtATime && succeeded.length < plan.policies.length
+                ? ` ${t('The remaining nodes were not changed.')}`
+                : ''
+            }`
+          : '';
+      setCreateError(`${msg}${suffix}`);
+      if (succeeded.length > 0) {
+        setCreated({ policyNames: succeeded, bondName: bondName.trim() });
+      }
+    } finally {
+      setCreating(false);
+      setCreatePhase('');
+    }
+  }, [
+    plan.policies,
+    plan.issues.length,
+    plan.strategy,
+    plan.targetNodeNames,
+    bondName,
+    bondMode,
+    selectedPorts,
+    t,
+    waitForNncpApply,
+  ]);
+
+  const handleCreateAnother = useCallback(() => {
+    const nextName = plan.suggestedBondName || 'bond0';
+    dashboardLogger.info(LOG_ACTION, 'Create another bond', `next=${nextName}`);
+    clearCreated();
+    setBondName(nextName);
+  }, [plan.suggestedBondName, clearCreated]);
 
   const closeRemoveModal = useCallback(() => {
     if (removing) return;
@@ -888,7 +942,7 @@ const NetworkBondPage: FC = () => {
                               <HelperText>
                                 <HelperTextItem>
                                   {t(
-                                    'Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node.',
+                                    'Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node. Per-node policies are applied one node at a time and do not cover nodes that join the pool later.',
                                   )}
                                 </HelperTextItem>
                               </HelperText>
@@ -1424,6 +1478,12 @@ const NetworkBondPage: FC = () => {
                             <CodeBlockCode>{previewYaml}</CodeBlockCode>
                           </CodeBlock>
                         </div>
+                      </StackItem>
+                    )}
+
+                    {createPhase && creating && (
+                      <StackItem>
+                        <Alert variant="info" isInline title={createPhase} />
                       </StackItem>
                     )}
 

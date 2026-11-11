@@ -313,5 +313,12 @@
   "{{address}} ({{node}}) is the gateway address": "{{address}} ({{node}}) is the gateway address",
   "{{address}} ({{node}}) is not in the gateway subnet {{subnet}}": "{{address}} ({{node}}) is not in the gateway subnet {{subnet}}",
   "The node addresses are in different /{{prefix}} subnets: {{subnets}}": "The node addresses are in different /{{prefix}} subnets: {{subnets}}",
-  "{{address}} is already configured on {{iface}} on node {{node}}": "{{address}} is already configured on {{iface}} on node {{node}}"
+  "{{address}} is already configured on {{iface}} on node {{node}}": "{{address}} is already configured on {{iface}} on node {{node}}",
+  "Creating {{name}} ({{index}} of {{total}})...": "Creating {{name}} ({{index}} of {{total}})...",
+  "{{index}} of {{total}} nodes; keep this page open until all nodes are done.": "{{index}} of {{total}} nodes; keep this page open until all nodes are done.",
+  "The remaining nodes were not changed.": "The remaining nodes were not changed.",
+  "Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node. Per-node policies are applied one node at a time and do not cover nodes that join the pool later.": "Untick nodes to leave them out. When only some nodes of a pool are selected, or with static IPv4, one policy is created per node. Per-node policies are applied one node at a time and do not cover nodes that join the pool later.",
+  "A /32 address has no subnet to reach a gateway in. Use a shorter prefix length or leave the gateway empty.": "A /32 address has no subnet to reach a gateway in. Use a shorter prefix length or leave the gateway empty.",
+  "The gateway adds a default route that competes with the default route on br-ex (the cluster network). Traffic can leave through this interface instead. Leave the gateway empty unless this network must be the default route.": "The gateway adds a default route that competes with the default route on br-ex (the cluster network). Traffic can leave through this interface instead. Leave the gateway empty unless this network must be the default route.",
+  "{{address}} is already configured on {{iface}} on node {{node}}; it moves to the new interface": "{{address}} is already configured on {{iface}} on node {{node}}; it moves to the new interface"
 }

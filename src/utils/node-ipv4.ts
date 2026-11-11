@@ -119,6 +119,12 @@ export function checkNodeAddresses(opts: {
   prefixLength: number;
   gateway?: string;
   nns?: NodeIpv4NnsLite[];
+  /**
+   * Interfaces this change replaces on each node (the new interface and its
+   * ports). An address already on one of these, on the node it is assigned
+   * to, is only a warning; anywhere else it blocks Create.
+   */
+  ownInterfaces?: string[];
 }): NodeIpv4Check {
   const issues: NodeIpv4Message[] = [];
   const warnings: NodeIpv4Message[] = [];
@@ -169,7 +175,14 @@ export function checkNodeAddresses(opts: {
     }
   }
 
-  if (gateway) {
+  if (gateway && prefix === 32) {
+    issues.push({
+      key: 'A /32 address has no subnet to reach a gateway in. Use a shorter prefix length or leave the gateway empty.',
+    });
+  } else if (gateway) {
+    warnings.push({
+      key: 'The gateway adds a default route that competes with the default route on br-ex (the cluster network). Traffic can leave through this interface instead. Leave the gateway empty unless this network must be the default route.',
+    });
     const gwSubnet = ipv4Subnet(gateway, prefix)!;
     for (const { node, ip } of valid) {
       if (ip === gateway) {
@@ -194,11 +207,22 @@ export function checkNodeAddresses(opts: {
     }
   }
 
+  // An address that already lives on another node or interface (br-ex, for
+  // example) would be configured twice and can cut a node off.
+  const own = new Set(opts.ownInterfaces || []);
+  const assignedTo = new Map(valid.map(({ node, ip }) => [ip, node]));
   for (const use of addressesInUse(opts.nns || [], valid.map(({ ip }) => ip))) {
-    warnings.push({
-      key: '{{address}} is already configured on {{iface}} on node {{node}}',
-      values: use,
-    });
+    if (assignedTo.get(use.address) === use.node && own.has(use.iface)) {
+      warnings.push({
+        key: '{{address}} is already configured on {{iface}} on node {{node}}; it moves to the new interface',
+        values: use,
+      });
+    } else {
+      issues.push({
+        key: '{{address}} is already configured on {{iface}} on node {{node}}',
+        values: use,
+      });
+    }
   }
 
   return { issues, warnings };
