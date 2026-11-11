@@ -83,7 +83,33 @@ export function fillSequentialAddresses(first: string, nodeNames: string[]): Rec
   return out;
 }
 
-/** One NNCP per node: hostname selectors, unique policy names. */
+/**
+ * kubernetes-nmstate labels each enactment with its policy name
+ * (`nmstate.io/policy`), and label values are at most 63 characters, so a
+ * longer NNCP name never gets enacted. Longer names keep their head and get a
+ * short hash of the full name so distinct names stay distinct.
+ */
+export const NNCP_NAME_MAX = 63;
+
+function shortHash(value: string): string {
+  // FNV-1a, 32 bit.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < value.length; i++) {
+    h ^= value.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(36).padStart(7, '0').slice(-7);
+}
+
+/** `name` cut to {@link NNCP_NAME_MAX} characters with a hash suffix when longer. */
+export function capPolicyName(name: string): string {
+  if (name.length <= NNCP_NAME_MAX) return name;
+  const suffix = `-${shortHash(name)}`;
+  const head = name.slice(0, NNCP_NAME_MAX - suffix.length).replace(/-+$/, '');
+  return `${head}${suffix}`;
+}
+
+/** One NNCP per node: hostname selectors, unique policy names of at most 63 characters. */
 export function perNodeTargets(
   nodeNames: string[],
   policyBase: string,
@@ -91,7 +117,7 @@ export function perNodeTargets(
 ): { nodeName: string; nodeSelector: Record<string, string>; policyName: string }[] {
   const used = new Set<string>();
   return nodeNames.map((nodeName) => {
-    const base = sanitize(`${policyBase}-${nodeName}`);
+    const base = capPolicyName(sanitize(`${policyBase}-${nodeName}`));
     let policyName = base;
     // Long FQDNs can collide once sanitized/truncated; keep names unique. The
     // suffix replaces the tail so a length limit in sanitize cannot drop it.
@@ -112,6 +138,11 @@ export type NodeIpv4Check = {
 /**
  * Checks for static per-node addresses sharing one prefix length and an
  * optional gateway. Issues block Create; warnings do not.
+ *
+ * `targetInterface` is the interface the addresses go on (the new bridge or
+ * bond). An address NodeNetworkState already reports anywhere else, on another
+ * node or another interface, blocks Create: taking a node's br-ex address cuts
+ * that node off.
  */
 export function checkNodeAddresses(opts: {
   nodeNames: string[];
@@ -119,12 +150,7 @@ export function checkNodeAddresses(opts: {
   prefixLength: number;
   gateway?: string;
   nns?: NodeIpv4NnsLite[];
-  /**
-   * Interfaces this change replaces on each node (the new interface and its
-   * ports). An address already on one of these, on the node it is assigned
-   * to, is only a warning; anywhere else it blocks Create.
-   */
-  ownInterfaces?: string[];
+  targetInterface?: string;
 }): NodeIpv4Check {
   const issues: NodeIpv4Message[] = [];
   const warnings: NodeIpv4Message[] = [];
@@ -177,12 +203,9 @@ export function checkNodeAddresses(opts: {
 
   if (gateway && prefix === 32) {
     issues.push({
-      key: 'A /32 address has no subnet to reach a gateway in. Use a shorter prefix length or leave the gateway empty.',
+      key: 'A /32 address has no gateway on its subnet. Leave the gateway empty or use a shorter prefix length.',
     });
   } else if (gateway) {
-    warnings.push({
-      key: 'The gateway adds a default route that competes with the default route on br-ex (the cluster network). Traffic can leave through this interface instead. Leave the gateway empty unless this network must be the default route.',
-    });
     const gwSubnet = ipv4Subnet(gateway, prefix)!;
     for (const { node, ip } of valid) {
       if (ip === gateway) {
@@ -207,22 +230,20 @@ export function checkNodeAddresses(opts: {
     }
   }
 
-  // An address that already lives on another node or interface (br-ex, for
-  // example) would be configured twice and can cut a node off.
-  const own = new Set(opts.ownInterfaces || []);
-  const assignedTo = new Map(valid.map(({ node, ip }) => [ip, node]));
+  if (gateway) {
+    warnings.push({
+      key: 'The gateway adds a default route on {{iface}} next to the one on br-ex, the cluster default network. Traffic that should leave through br-ex may leave through this interface instead. Leave the gateway empty unless this network must carry the default route.',
+      values: { iface: opts.targetInterface || '?' },
+    });
+  }
+
+  const nodeOf = new Map(valid.map(({ node, ip }) => [ip, node]));
   for (const use of addressesInUse(opts.nns || [], valid.map(({ ip }) => ip))) {
-    if (assignedTo.get(use.address) === use.node && own.has(use.iface)) {
-      warnings.push({
-        key: '{{address}} is already configured on {{iface}} on node {{node}}; it moves to the new interface',
-        values: use,
-      });
-    } else {
-      issues.push({
-        key: '{{address}} is already configured on {{iface}} on node {{node}}',
-        values: use,
-      });
-    }
+    const sameSpot = use.node === nodeOf.get(use.address) && use.iface === opts.targetInterface;
+    (sameSpot ? warnings : issues).push({
+      key: '{{address}} is already configured on {{iface}} on node {{node}}',
+      values: use,
+    });
   }
 
   return { issues, warnings };

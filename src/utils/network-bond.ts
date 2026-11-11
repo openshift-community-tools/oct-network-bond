@@ -3,7 +3,7 @@
  * NodeNetworkConfigurationPolicy is an implementation detail; the UI talks about bonds.
  */
 
-import { checkNodeAddresses, perNodeTargets } from './node-ipv4';
+import { capPolicyName, checkNodeAddresses, perNodeTargets } from './node-ipv4';
 
 export type NodeRole = 'control-plane' | 'worker' | 'other';
 
@@ -903,33 +903,14 @@ export function planNncpTargets(groups: McpNicGroup[]): {
   };
 }
 
-/**
- * NMState labels each enactment with `nmstate.io/policy: <policy name>`, and
- * label values are limited to 63 characters, so policy names are kept to 63.
- */
-export const NNCP_NAME_MAX = 63;
-
-/** Short stable hash (FNV-1a, 8 hex digits) to keep truncated names unique. */
-function shortHash(value: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < value.length; i++) {
-    h ^= value.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h.toString(16).padStart(8, '0');
-}
-
 export function sanitizeK8sName(raw: string): string {
   const s = raw
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-+|-+$/g, '');
-  if (!s) return 'netbond';
-  if (s.length <= NNCP_NAME_MAX) return s;
-  const suffix = `-${shortHash(s)}`;
-  const head = s.slice(0, NNCP_NAME_MAX - suffix.length).replace(/-+$/, '');
-  return `${head}${suffix}`;
+  // NNCP names double as the nmstate.io/policy label value on enactments (max 63).
+  return capPolicyName(s || 'netbond');
 }
 
 function ipv4Spec(ipv4: BondIpv4Config): Record<string, unknown> {
@@ -1160,11 +1141,8 @@ export function planMcpNncps(opts: {
       prefixLength: opts.ipv4.prefixLength ?? 24,
       gateway: opts.ipv4.gateway,
       nns: opts.nnsList,
-      ownInterfaces: [
-        opts.bondName.trim(),
-        ...(ovs ? [ovsBridgeName(opts.bondName)] : []),
-        ...opts.selectedPorts.map((p) => p.trim()),
-      ].filter(Boolean),
+      // The address goes on the bond, or on the bridge's internal interface for OVS.
+      targetInterface: ovs ? ovsBridgeName(opts.bondName) : opts.bondName.trim(),
     });
     issues.push(...addressCheck.issues);
     warnings.push(...addressCheck.warnings);
